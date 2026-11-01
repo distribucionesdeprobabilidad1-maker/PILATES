@@ -600,7 +600,7 @@ function setPago(k,campo,v){
   else pg[campo]=v;
   save();render();
 }
-function setSuelta(id,campo,v){const e=S.extras.find(x=>x.id===id);if(!e)return;e[campo]=v;save();render()}
+function setSuelta(id,campo,v){const e=S.extras.find(x=>x.id===id);if(!e)return;e[campo]=v;if(campo==='pagado')e.fechaPago=v?(e.fechaPago||TODAY()):null;save();render()}
 function vPagos(){
   const mes=ui.mesPagos;let cob=0,pend=0;
   const rows=S.alumnos.filter(a=>a.activo!==false||S.pagos[mes+'|'+a.id]||sueltasMes(a.id,mes).length).sort(byNombre).map(a=>{
@@ -613,8 +613,9 @@ function vPagos(){
       <div class="phd"><b onclick="verFicha('${a.id}')">${esc(a.nombre)}</b></div>
       <label>Plan<select onchange="cambiarPlan('${a.id}','${mes}',this.value)">${planOpts(pid)}</select></label>
       ${p?`<div class="prow"><label class="sw"><input type="checkbox" ${pg.pagado?'checked':''} onchange="setPago('${k}','pagado',this.checked)"><span>${pg.pagado?'Pagó'+(pg.fecha?' el '+fmtCorto(pg.fecha):''):'No pagó'}</span></label><input class="monto" type="number" inputmode="numeric" value="${monto}" onchange="setPago('${k}','monto',+this.value)"></div>
+      ${pg.pagado?`<label>Fecha de pago<input type="date" value="${pg.fecha||''}" onchange="setPago('${k}','fecha',this.value||null)"></label>`:''}
       <select onchange="setPago('${k}','metodo',this.value)">${['','Efectivo','Transferencia','Otro'].map(m=>`<option value="${m}" ${(pg.metodo||'')===m?'selected':''}>${m||'Medio de pago…'}</option>`).join('')}</select>`:''}
-      ${sl.map(e=>`<div class="prow"><label class="sw"><input type="checkbox" ${e.pagado?'checked':''} onchange="setSuelta('${e.id}','pagado',this.checked)"><span>Clase suelta ${fmtCorto(e.fecha)}</span></label><input class="monto" type="number" inputmode="numeric" value="${e.monto||0}" onchange="setSuelta('${e.id}','monto',+this.value)"></div>`).join('')}
+      ${sl.map(e=>`<div class="prow"><label class="sw"><input type="checkbox" ${e.pagado?'checked':''} onchange="setSuelta('${e.id}','pagado',this.checked)"><span>Clase suelta ${fmtCorto(e.fecha)}</span></label><input class="monto" type="number" inputmode="numeric" value="${e.monto||0}" onchange="setSuelta('${e.id}','monto',+this.value)"></div>${e.pagado?`<label>Fecha de pago de la clase suelta<input type="date" value="${e.fechaPago||''}" onchange="setSuelta('${e.id}','fechaPago',this.value||null)"></label>`:''}`).join('')}
     </div>`;
     return{debe,tiene,html};
   });
