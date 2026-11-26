@@ -67,7 +67,12 @@ hr{border:0;border-top:1px solid var(--line);margin:14px 0}
 .cardoff{opacity:.55}
 .sl{display:flex;align-items:center;gap:10px}
 .link.small{font-size:13px;color:var(--muted);font-weight:500}
-.nro.ult{background:var(--warn);color:#fff}
+.nro.ok{background:var(--ok);color:#fff}
+.nro.bad{background:var(--bad);color:#fff}
+.nro.ult{box-shadow:0 0 0 2px var(--warn)}
+.legend .nro{margin:0 2px;min-width:22px;font-size:12px}
+.pk{display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;text-align:left;padding:10px 0;border-top:1px solid var(--line)}
+.pk:first-of-type{border-top:0}
 .nro{display:inline-block;min-width:26px;text-align:center;margin-right:8px;padding:2px 6px;border-radius:8px;background:var(--accent-soft);color:var(--accent);font-size:14px}
 .add{width:100%;margin-top:6px;padding:10px;border:1.5px dashed var(--line);border-radius:10px;color:var(--accent);font-weight:600}
 .tag{font-style:normal;font-size:11px;padding:2px 7px;border-radius:20px;background:var(--bg);color:var(--muted);font-weight:600;vertical-align:middle}
@@ -195,6 +200,8 @@ function defState(){return{
   extras:[],     // {id, fecha, horarioId, alumnoId, tipo:'suelta'|'recupero', origen, monto, pagado}
   pagos:{},      // 'YYYY-MM|alumnoId' -> {pagado, monto, fecha, metodo}
   suspendidos:{}, // 'fecha' (día entero) o 'fecha|horarioId' -> {motivo}
+  pagosPack:[],   // {id, alumnoId, desde (1ª clase del pack), pagado, fecha, monto, metodo}
+  pagosDesde:null, // los packs que empiezan antes de esta fecha no se controlan
   ultimoBackup:null
 }}
 let S;
@@ -296,7 +303,7 @@ function enClase(fecha,hId){
 }
 // Sin marca: clases pasadas quedan 'sinmarca' (ella marca el presente); futuras quedan pendientes.
 function susp(fecha,hId){const sp=S.suspendidos||{};return sp[fecha]||sp[fecha+'|'+hId]||null}
-function estadoDe(fecha,h,aId){if(susp(fecha,h))return 'suspendida';const m=S.marcas[mkey(fecha,h,aId)];if(m)return m.estado;return fecha<TODAY()?'sinmarca':'pend'}
+function estadoDe(fecha,h,aId){const m=S.marcas[mkey(fecha,h,aId)];if(susp(fecha,h))return m&&m.estado==='reprogramada'?'reprogramada':'suspendida';if(m)return m.estado;return fecha<TODAY()?'sinmarca':'pend'}
 
 function planDe(a,mes){let p='';(a.planes||[]).slice().sort((x,y)=>x.desde.localeCompare(y.desde)).forEach(x=>{if(x.desde<=mes)p=x.planId});return p}
 function setPlanAlumno(a,mes,planId){a.planes=(a.planes||[]).filter(x=>x.desde!==mes);a.planes.push({desde:mes,planId})}
@@ -333,10 +340,25 @@ function pendientes(aId){
     return !S.extras.some(e=>e.fecha===f&&e.horarioId===h&&e.alumnoId===aId&&e.tipo==='suelta');
   }).sort();
 }
+/* Clases suspendidas (últimos 30 días y próximas) que el alumno todavía no reprogramó */
+function pendSusp(aId){
+  const desde=addDays(TODAY(),-30),out=[];
+  Object.keys(S.suspendidos||{}).forEach(k=>{
+    const[f,h]=k.split('|');if(f<desde)return;
+    (h?[H(h)]:horariosDia(wd(f))).forEach(x=>{
+      if(!x||!enClase(f,x.id).some(i=>i.alumno.id===aId))return;
+      const m=S.marcas[mkey(f,x.id,aId)];if(m&&(m.estado==='reprogramada'||m.estado==='noRecupera'))return;
+      out.push(mkey(f,x.id,aId));
+    });
+  });
+  return [...new Set(out)].sort();
+}
 /* Contador: número de clase de cada alumno, desde contador.desde (sin contar ausentes ni reprogramadas) */
 let _memo={};
 function primeraClase(a){let m=null;S.fijos.forEach(f=>{if(f.alumnoId===a.id&&(!m||f.desde<m))m=f.desde});S.extras.forEach(e=>{if(e.alumnoId===a.id&&(!m||e.fecha<m))m=e.fecha});return m}
-function contDesde(a){return (a.contador&&a.contador.desde)||primeraClase(a)}
+/* Anclas del contador: {desde, hora?, base}. La 1ª clase en o después de cada ancla lleva el número base+1. */
+function anclas(a){return (a.anclas||[]).slice().sort((x,y)=>(x.desde+(x.hora||'')).localeCompare(y.desde+(y.hora||'')))}
+function contDesde(a){const an=anclas(a);return an.length?an[0].desde:primeraClase(a)}
 function clasesValidas(aId,desde,hasta){
   const k=aId+'|'+desde+'|'+hasta;if(_memo[k])return _memo[k];
   const misF=S.fijos.filter(f=>f.alumnoId===aId),res=[];
@@ -346,16 +368,36 @@ function clasesValidas(aId,desde,hasta){
   return _memo[k]=ok;
 }
 function cicloDe(p){return p?(p.clases||p.porSemana*4):0}
-/* Numeración consecutiva: no se reinicia por mes; vuelve a 1 al completar las clases del plan */
+/* Numeración consecutiva: no se reinicia por mes ni con el pago; vuelve a 1 al completar las clases del plan */
 function numeracion(aId,hasta){
-  const a=A(aId);if(!a)return [];const desde=contDesde(a);if(!desde||hasta<desde)return [];
-  let c=(a.contador&&a.contador.base)||0;
-  return clasesValidas(aId,desde,hasta).map(o=>{const tope=cicloDe(P(planDe(a,ym(o.fecha))));c++;if(tope&&c>tope)c=1;return {fecha:o.fecha,hId:o.h.id,n:c,tope}});
+  const a=A(aId);if(!a)return [];const an=anclas(a),desde=an.length?an[0].desde:primeraClase(a);if(!desde||hasta<desde)return [];
+  let c=an.length?an[0].base:0,j=1;
+  return clasesValidas(aId,desde,hasta).map(o=>{
+    const key=o.fecha+o.h.hora;while(j<an.length&&key>=an[j].desde+(an[j].hora||'')){c=an[j].base;j++}
+    const tope=cicloDe(P(planDe(a,ym(o.fecha))));c++;if(tope&&c>tope)c=1;return {fecha:o.fecha,hId:o.h.id,n:c,tope}});
 }
-function nroClase(fecha,hId,aId){const x=numeracion(aId,fecha).find(o=>o.fecha===fecha&&o.hId===hId);return x||null}
+/* Packs: cada vez que la cuenta vuelve a 1 empieza un pack nuevo. El pago se asocia al pack, no al mes. */
+const HORIZ=120;
+function packsDe(aId){
+  const k='packs|'+aId;if(_memo[k])return _memo[k];
+  const l=numeracion(aId,addDays(TODAY(),HORIZ)),out=[];
+  l.forEach((o,i)=>{if(i===0||o.n===1||o.n<=l[i-1].n)out.push({aId,start:o.fecha,tope:o.tope,items:[]});const pk=out[out.length-1];o.pack=pk;pk.items.push(o)});
+  out.forEach((pk,i)=>pk.end=out[i+1]?out[i+1].start:null);
+  return _memo[k]=out;
+}
+function pagoDe(pk){return (S.pagosPack||[]).find(r=>r.alumnoId===pk.aId&&r.desde>=pk.start&&(!pk.end||r.desde<pk.end))||null}
+function estadoPack(pk){if(!pk||!pk.tope||!S.pagosDesde||pk.start<S.pagosDesde)return '';const r=pagoDe(pk);return r&&r.pagado?'ok':'bad'}
+function hechasPack(pk){return pk.items.filter(o=>o.fecha<TODAY()||estadoDe(o.fecha,o.hId,pk.aId)==='presente').length}
+function packActual(aId){const ps=packsDe(aId);let r=null;ps.forEach(p=>{if(p.start<=TODAY())r=p});return r||ps[0]||null}
+function deudas(aId){return packsDe(aId).filter(p=>p.start<=TODAY()&&estadoPack(p)==='bad')}
+function nroClase(fecha,hId,aId){
+  const src=fecha<=addDays(TODAY(),HORIZ)?[].concat(...packsDe(aId).map(p=>p.items)):numeracion(aId,fecha);
+  return src.find(o=>o.fecha===fecha&&o.hId===hId)||null;
+}
+function nroHtml(o){if(!o)return '';const e=estadoPack(o.pack);return `<b class="nro ${e} ${o.tope&&o.n===o.tope?'ult':''}">${o.n}</b>`}
 function vaPor(a){const l=numeracion(a.id,TODAY()).filter(o=>o.fecha<TODAY()||estadoDe(o.fecha,o.hId,a.id)==='presente');const u=l[l.length-1];if(!u)return 'Todavía no tiene clases contadas.';return `Va por la clase <b>${u.n}</b>${u.tope?' de '+u.tope:''}.`}
-function corregirNro(f,aId){const n=parseInt(document.getElementById('nroIn').value,10);if(!(n>=1))return toast('Poné un número válido');const a=A(aId);a.contador={desde:f,base:n-1};save();closeSheet();render();toast('Contador actualizado')}
-function guardarContador(aId){const a=A(aId),d=document.getElementById('cD').value,b=parseInt(document.getElementById('cB').value,10)||0;if(!d)return toast('Elegí la fecha');a.contador={desde:d,base:Math.max(0,b)};save();render();toast('Contador actualizado')}
+function corregirNro(f,hId,aId){const n=parseInt(document.getElementById('nroIn').value,10);if(!(n>=1))return toast('Poné un número válido');const a=A(aId),hora=H(hId).hora;a.anclas=anclas(a).filter(x=>!(x.desde===f&&(x.hora||'')===hora));a.anclas.push({desde:f,hora,base:n-1});save();closeSheet();render();toast('Contador actualizado')}
+function guardarContador(aId){const a=A(aId),d=document.getElementById('cD').value,b=parseInt(document.getElementById('cB').value,10)||0;if(!d)return toast('Elegí la fecha');a.anclas=anclas(a).filter(x=>x.desde>d);a.anclas.unshift({desde:d,base:Math.max(0,b)});save();render();toast('Contador actualizado')}
 
 function descKey(k){const[f,h]=k.split('|');const x=H(h);return `${DIAS_C[wd(f)]} ${fmtCorto(f)}${x?' · '+x.hora:''}`}
 
@@ -415,17 +457,24 @@ function vCal(){
     if(!l.length)h+=`<div class="muted small">Sin alumnos</div>`;
     l.sort((a,b)=>byNombre(a.alumno,b.alumno)).forEach(i=>{
       const e=estadoDe(fecha,x.id,i.alumno.id);
-      h+=`<button class="row" onclick="hojaClase('${fecha}','${x.id}','${i.alumno.id}')"><span class="nm">${(o=>o?`<b class="nro ${o.tope&&o.n===o.tope?'ult':''}">${o.n}</b>`:'')(nroClase(fecha,x.id,i.alumno.id))}${esc(i.alumno.nombre)}${i.tipo!=='fijo'?` <em class="tag ${i.tipo}">${TIPO[i.tipo]}</em>`:''}</span>${pill(fecha,x.id,i.alumno.id,e)}</button>`;
+      h+=`<button class="row" onclick="hojaClase('${fecha}','${x.id}','${i.alumno.id}')"><span class="nm">${nroHtml(nroClase(fecha,x.id,i.alumno.id))}${esc(i.alumno.nombre)}${i.tipo!=='fijo'?` <em class="tag ${i.tipo}">${TIPO[i.tipo]}</em>`:''}</span>${pill(fecha,x.id,i.alumno.id,e)}</button>`;
     });
     h+=`<button class="add" onclick="hojaAgregar('${fecha}','${x.id}')">+ Agregar alumno</button></div>`;
   });
-  h+=`<p class="legend">Número en naranja = última clase del pack.</p>`;
+  h+=`<p class="legend"><b class="nro ok">3</b> pack pagado · <b class="nro bad">3</b> pack sin pagar · <b class="nro ult">8</b> última clase del pack</p>`;
   return h;
 }
 
 function hojaClase(f,hId,aId){
   const a=A(aId),h=H(hId);const it=enClase(f,hId).find(i=>i.alumno.id===aId);const e=estadoDe(f,hId,aId);
-  if(e==='suspendida'){openSheet(`<h3>${esc(a.nombre)}</h3><p class="muted">${DIAS[wd(f)]} ${fmtCorto(f)} · ${h.hora}</p><p>Esta clase está suspendida (${esc(susp(f,hId).motivo)}). No cuenta como ausencia ni suma al número de clase.</p><button class="btn ghost" onclick="verFicha('${aId}')">Ver ficha</button>`);return}
+  const sp=susp(f,hId);
+  if(sp){
+    const m=S.marcas[mkey(f,hId,aId)];let y=`<h3>${esc(a.nombre)}</h3><p class="muted">${DIAS[wd(f)]} ${fmtCorto(f)} · ${h.hora}</p><p>Clase suspendida (${esc(sp.motivo)}). No cuenta como ausencia ni suma al número de clase.</p>`;
+    if(e==='reprogramada')y+=`<p>Reprogramada ${pill(f,hId,aId,e)}</p><button class="btn ghost" onclick="hojaReprog('${f}','${hId}','${aId}')">Cambiar el día</button><button class="btn ghost bad" onclick="marcar('${f}','${hId}','${aId}',null)">Deshacer la reprogramación</button>`;
+    else{y+=`<button class="btn" onclick="hojaReprog('${f}','${hId}','${aId}')">Reprogramar esta clase</button>`;
+      y+=m&&m.estado==='noRecupera'?`<button class="btn ghost" onclick="marcar('${f}','${hId}','${aId}',null)">Volver a dejarla pendiente de recuperar</button>`:`<button class="btn ghost" onclick="marcar('${f}','${hId}','${aId}','noRecupera')">No la recupera</button>`}
+    y+=`<button class="btn ghost" onclick="verFicha('${aId}')">Ver ficha</button>`;
+    openSheet(y);return}
   let x=`<h3>${esc(a.nombre)}</h3><p class="muted">${DIAS[wd(f)]} ${fmtCorto(f)} · ${h.hora}${it&&it.tipo!=='fijo'?' · '+TIPO[it.tipo]:''}</p>
   <div class="grid3"><button class="opt ok ${e==='presente'?'sel':''}" onclick="marcar('${f}','${hId}','${aId}','presente')">Presente</button><button class="opt bad ${e==='ausente'?'sel':''}" onclick="marcar('${f}','${hId}','${aId}','ausente')">Ausente</button>`;
   if(it&&it.tipo!=='suelta')x+=`<button class="opt warn ${e==='reprogramada'?'sel':''}" onclick="hojaReprog('${f}','${hId}','${aId}')">Reprogramar</button>`;
@@ -435,7 +484,8 @@ function hojaClase(f,hId,aId){
   if(it&&it.tipo==='fijo')x+=`<button class="btn ghost" onclick="quitarFijo('${it.fijoId}','${monday(f)}')">Sacar de este horario desde esta semana</button>`;
   if(it&&it.extraId)x+=`<button class="btn ghost" onclick="quitarExtra('${it.extraId}')">Quitar esta clase</button>`;
   const nroO=nroClase(f,hId,aId),nro=nroO?nroO.n:'';
-  if(e!=='ausente'&&e!=='reprogramada')x+=`<div class="prow"><label>Número de clase<input id="nroIn" type="number" inputmode="numeric" min="1" value="${nro}"></label><button class="btn sm ghost" style="margin-top:22px" onclick="corregirNro('${f}','${aId}')">Corregir</button></div><p class="muted small">Para empezar un ciclo nuevo poné 1 en esta clase. Las siguientes se numeran solas.</p>`;
+  if(e!=='ausente'&&e!=='reprogramada')x+=`<div class="prow"><label>Número de clase<input id="nroIn" type="number" inputmode="numeric" min="1" value="${nro}"></label><button class="btn sm ghost" style="margin-top:22px" onclick="corregirNro('${f}','${hId}','${aId}')">Corregir</button></div><p class="muted small">Para empezar un ciclo nuevo poné 1 en esta clase. Las siguientes se numeran solas.</p>`;
+  if(nroO&&estadoPack(nroO.pack))x+=packLinea(nroO.pack);
   x+=`<button class="btn ghost" onclick="verFicha('${aId}')">Ver ficha</button>`;
   openSheet(x);
 }
@@ -444,7 +494,7 @@ function borrarExtra(id){
   const e=S.extras.find(x=>x.id===id);if(!e)return;
   S.extras=S.extras.filter(x=>x.id!==id);
   delete S.marcas[mkey(e.fecha,e.horarioId,e.alumnoId)];
-  if(e.origen&&S.marcas[e.origen]&&S.marcas[e.origen].extraId===id)S.marcas[e.origen]={estado:'ausente'}; // vuelve a quedar para recuperar
+  if(e.origen&&S.marcas[e.origen]&&S.marcas[e.origen].extraId===id){const[of,oh]=e.origen.split('|');if(susp(of,oh))delete S.marcas[e.origen];else S.marcas[e.origen]={estado:'ausente'}} // vuelve a quedar para recuperar
 }
 function limpiarReprog(k){const m=S.marcas[k];if(m&&m.extraId){const id=m.extraId;delete S.marcas[k];borrarExtra(id)}}
 function marcar(f,h,a,est){const k=mkey(f,h,a);limpiarReprog(k);if(est)S.marcas[k]={estado:est};else delete S.marcas[k];save();closeSheet();render()}
@@ -467,18 +517,20 @@ function hojaReprog(f,hId,aId){
   <label>Nuevo día<input type="date" id="rpF" value="${f}" onchange="rpOpts()"></label>
   <label>Horario<select id="rpH"></select></label>
   <button class="btn" onclick="confReprog('${f}','${hId}','${aId}')">Confirmar</button>
-  <button class="link" onclick="marcar('${f}','${hId}','${aId}','ausente')">Todavía no sabe cuándo: marcar ausente y dejar para recuperar</button>`);
+  ${susp(f,hId)?'':`<button class="link" onclick="marcar('${f}','${hId}','${aId}','ausente')">Todavía no sabe cuándo: marcar ausente y dejar para recuperar</button>`}`);
   rpOpts();
 }
 function rpOpts(){
   const f=document.getElementById('rpF').value,s=document.getElementById('rpH');
   if(!f){s.innerHTML='';return}
   const hs=horariosDia(wd(f));
-  s.innerHTML=hs.length?hs.map(h=>`<option value="${h.id}">${h.hora} (${enClase(f,h.id).length}/${h.cupo})</option>`).join(''):'<option value="">No hay clases ese día</option>';
+  s.innerHTML=hs.length?hs.map(h=>`<option value="${h.id}" ${susp(f,h.id)?'disabled':''}>${h.hora} (${enClase(f,h.id).length}/${h.cupo})${susp(f,h.id)?' · suspendida':''}</option>`).join(''):'<option value="">No hay clases ese día</option>';
+  const ok=[...s.options].find(o=>!o.disabled);if(ok)s.value=ok.value;
 }
 function confReprog(f,hId,aId){
   const nf=document.getElementById('rpF').value,nh=document.getElementById('rpH').value;
   if(!nf||!nh)return toast('Elegí día y horario');
+  if(susp(nf,nh))return toast('Ese horario está suspendido');
   if(enClase(nf,nh).some(i=>i.alumno.id===aId))return toast('Ya está anotada en ese horario');
   const k=mkey(f,hId,aId);limpiarReprog(k);
   const e={id:uid(),fecha:nf,horarioId:nh,alumnoId:aId,tipo:'recupero',origen:k};
@@ -527,11 +579,15 @@ function confAgregar(f,hId){
 
 /* ============ Alumnos ============ */
 function estadoPago(a,mes){
-  const p=planDe(a,mes),sl=sueltasMes(a.id,mes);
-  if(!p&&!sl.length)return '';
-  const pg=S.pagos[mes+'|'+a.id];
-  const debe=(p&&!(pg&&pg.pagado))||sl.some(e=>!e.pagado);
-  return debe?`<span class="pill bad">Debe</span>`:`<span class="pill ok">Pagó</span>`;
+  const d=deudas(a.id).length,sl=sueltasMes(a.id,mes).filter(e=>!e.pagado).length,pa=packActual(a.id);
+  if(d)return `<span class="pill bad">Debe${d>1?' '+d+' packs':''}</span>`;
+  if(sl)return `<span class="pill bad">Debe suelta</span>`;
+  return pa&&estadoPack(pa)==='ok'?`<span class="pill ok">Pagó</span>`:'';
+}
+function packLinea(pk){
+  const r=pagoDe(pk),e=estadoPack(pk),n=hechasPack(pk);
+  const st=e==='ok'?`<span class="pill ok">Pagó${r.fecha?' el '+fmtCorto(r.fecha):''}</span>`:pk.start>TODAY()?`<span class="pill">Empieza el ${fmtCorto(pk.start)}</span>`:`<span class="pill bad">Sin pagar</span>`;
+  return `<button class="pk" onclick="hojaPago('${pk.aId}','${pk.start}')"><span>Pack desde ${fmtCorto(pk.start)}<br><span class="muted small">${n} de ${pk.tope} clases hechas</span></span>${st}</button>`;
 }
 function vAlumnos(){
   return `<div class="toolbar"><input type="search" placeholder="Buscar alumno" value="${esc(ui.busq)}" oninput="ui.busq=this.value;document.getElementById('alist').innerHTML=listaAl()"><button class="btn sm" onclick="hojaNuevo()">+ Nuevo</button></div>
@@ -544,7 +600,7 @@ function listaAl(){
   const l=S.alumnos.filter(a=>(ui.verBajas||a.activo!==false)&&norm(a.nombre).includes(q)).sort(byNombre);
   if(!l.length)return `<p class="muted center">Sin resultados</p>`;
   return l.map(a=>{
-    const p=P(planDe(a,mes)),fx=fijosDe(a.id,lun),pen=pendientes(a.id).length;
+    const p=P(planDe(a,mes)),fx=fijosDe(a.id,lun),pen=pendientes(a.id).length+pendSusp(a.id).length;
     return `<button class="card arow" onclick="verFicha('${a.id}')"><div><b>${esc(a.nombre)}</b>${a.activo===false?' <em class="tag">Baja</em>':''}<div class="muted small">${p?esc(p.nombre):'Sin plan'}${fx.length?' · '+fx.map(f=>{const x=H(f.horarioId);return DIAS_C[x.dia]+' '+x.hora}).join(', '):''}</div></div><div class="badges">${estadoPago(a,mes)}${pen?`<span class="pill warn">${pen} a recuperar</span>`:''}</div></button>`;
   }).join('');
 }
@@ -560,7 +616,7 @@ function vFicha(){
   let h=`<button class="link" onclick="ui.alumnoId=null;render()">‹ Alumnos</button>
   <div class="card"><label>Nombre<input id="fN" value="${esc(a.nombre)}"></label><label>Teléfono<input id="fT" type="tel" value="${esc(a.tel||'')}"></label><label>Notas<textarea id="fO" rows="2">${esc(a.notas||'')}</textarea></label>
   <div class="rowbtns"><button class="btn sm" onclick="guardarFicha()">Guardar</button>${a.tel?`<a class="btn sm ghost" href="https://wa.me/${esc(a.tel.replace(/\D/g,''))}" target="_blank" rel="noopener">WhatsApp</a>`:''}</div></div>`;
-  h+=`<div class="card"><h4>Contador de clases</h4><p>${vaPor(a)}</p><div class="prow"><label>Contar desde<input type="date" id="cD" value="${contDesde(a)||TODAY()}"></label><label>Clases ya hechas del ciclo<input type="number" id="cB" inputmode="numeric" min="0" value="${(a.contador&&a.contador.base)||0}"></label></div><button class="btn sm ghost" onclick="guardarContador('${a.id}')">Guardar contador</button><p class="muted small">La cuenta sigue de corrido entre meses y vuelve a 1 al completar las clases del plan. Las ausentes o reprogramadas no suman.</p></div>`;
+  h+=`<div class="card"><h4>Contador de clases</h4><p>${vaPor(a)}</p><div class="prow"><label>Contar desde<input type="date" id="cD" value="${contDesde(a)||TODAY()}"></label><label>Clases ya hechas del ciclo<input type="number" id="cB" inputmode="numeric" min="0" value="${(anclas(a)[0]||{}).base||0}"></label></div><button class="btn sm ghost" onclick="guardarContador('${a.id}')">Guardar contador</button><p class="muted small">La cuenta sigue de corrido entre meses y vuelve a 1 al completar las clases del plan. Las ausentes o reprogramadas no suman.</p></div>`;
   h+=`<div class="card"><h4>Horarios fijos</h4>${fx.length?fx.map(f=>{const x=H(f.horarioId);return `<div class="li"><span>${DIAS[x.dia]} ${x.hora}</span><button class="link bad" onclick="quitarFijo('${f.id}','${lun}')">Sacar</button></div>`}).join(''):'<p class="muted small">No tiene horarios fijos. Se agregan desde el Calendario.</p>'}
   ${p&&a.activo!==false&&fx.length!==p.porSemana?`<p class="aviso">Su plan es de ${p.porSemana} por semana y tiene ${fx.length} horario${fx.length===1?'':'s'} fijo${fx.length===1?'':'s'}.</p>`:''}</div>`;
   h+=`<div class="mesnav"><button class="ic" onclick="ui.mesAl=addMonth(ui.mesAl,-1);render()">‹</button><b>${cap(mesLabel(mes))}</b><button class="ic" onclick="ui.mesAl=addMonth(ui.mesAl,1);render()">›</button></div>`;
@@ -568,8 +624,13 @@ function vFicha(){
   h+=`<div class="card"><label>Plan de este mes<select onchange="cambiarPlan('${a.id}','${mes}',this.value)">${planOpts(pid)}</select></label><p class="muted small">Si lo cambiás, rige desde ${mesLabel(mes)} en adelante.</p>
   <div class="stats">${stat(r.tomadas,'Tomadas')}${stat(r.ausentes,'Ausentes')}${stat(r.reprog,'Reprogramadas')}${stat(r.recuperos,'Recuperos')}${stat(r.sueltas,'Sueltas')}${stat(r.sinmarca,'Sin marcar')}</div>
   <p class="muted small">Clases fijas del mes: ${r.previstas}${r.proximas?' · Por venir: '+r.proximas:''}${r.susp?' · Suspendidas: '+r.susp:''}${p?' · Plan: '+p.porSemana+' por semana':''}</p>
-  ${pid||sueltasMes(a.id,mes).length?`<div class="li"><span>Pago de ${MESES[+mes.slice(5)-1]}: ${estadoPago(a,mes)}${pg&&pg.pagado&&pg.fecha?' <span class="muted small">el '+fmtCorto(pg.fecha)+'</span>':''}</span><button class="link" onclick="ui.mesPagos='${mes}';tab('pag')">Ir a pagos</button></div>`:''}</div>`;
+  </div>`;
+  {const pa=packActual(a.id),dd=deudas(a.id).filter(p=>p!==pa);
+   if(pa&&estadoPack(pa)){h+=`<div class="card"><h4>Pack actual</h4>${packLinea(pa)}${dd.length?`<h4 style="margin-top:10px">Packs anteriores sin pagar</h4>${dd.map(packLinea).join('')}`:''}</div>`}
+   else h+=`<p class="muted small">${pid?'Los pagos se controlan desde el '+fmtCorto(S.pagosDesde)+' (se cambia en Ajustes).':'Asignale un plan para controlar sus packs y pagos.'}</p>`}
   h+=`<div class="card"><h4>Clases de ${mesLabel(mes)}</h4>${occ.length?occ.map(o=>`<button class="li" onclick="hojaClase('${o.fecha}','${o.h.id}','${a.id}')"><span>${DIAS_C[wd(o.fecha)]} ${fmtCorto(o.fecha)} · ${o.h.hora}${o.tipo!=='fijo'?` <em class="tag ${o.tipo}">${TIPO[o.tipo]}</em>`:''}</span>${pill(o.fecha,o.h.id,a.id,o.estado)}</button>`).join(''):'<p class="muted small">Sin clases este mes.</p>'}</div>`;
+  const ps=pendSusp(a.id);
+  if(ps.length)h+=`<div class="card"><h4>Clases suspendidas sin reprogramar</h4>${ps.map(k=>{const[f,hh]=k.split('|');return `<div class="li"><span>${descKey(k)} <span class="muted small">${esc((susp(f,hh)||{}).motivo||'')}</span></span><button class="link" onclick="hojaClase('${f}','${hh}','${a.id}')">Reprogramar</button></div>`}).join('')}</div>`;
   if(pen.length)h+=`<div class="card"><h4>Pendientes de recuperar</h4>${pen.map(k=>{const[f,hh]=k.split('|');return `<div class="li"><span>${descKey(k)}</span><button class="link" onclick="hojaReprog('${f}','${hh}','${a.id}')">Reprogramar</button></div>`}).join('')}</div>`;
   h+=`<div class="rowbtns">${a.activo===false?`<button class="btn ghost" onclick="reactivar('${a.id}')">Reactivar</button>`:`<button class="btn ghost" onclick="darBaja('${a.id}')">Dar de baja</button>`}<button class="btn ghost bad" onclick="eliminarAl('${a.id}')">Eliminar</button></div>`;
   return h;
@@ -588,44 +649,61 @@ function eliminarAl(id){
   if(!confirm('Se borra el alumno con TODO su historial de clases y pagos. ¿Eliminar?'))return;
   S.alumnos=S.alumnos.filter(a=>a.id!==id);S.fijos=S.fijos.filter(f=>f.alumnoId!==id);S.extras=S.extras.filter(e=>e.alumnoId!==id);
   Object.keys(S.marcas).forEach(k=>{if(k.endsWith('|'+id))delete S.marcas[k]});
-  Object.keys(S.pagos).forEach(k=>{if(k.endsWith('|'+id))delete S.pagos[k]});
+  Object.keys(S.pagos).forEach(k=>{if(k.endsWith('|'+id))delete S.pagos[k]});S.pagosPack=(S.pagosPack||[]).filter(r=>r.alumnoId!==id);
   ui.alumnoId=null;save();render();toast('Eliminado');
 }
 
 /* ============ Pagos ============ */
-function montoPlan(a,mes){const pg=S.pagos[mes+'|'+a.id];if(pg&&pg.monto!=null)return pg.monto;const p=P(planDe(a,mes));return p?p.precio:0}
-function setPago(k,campo,v){
-  const[mes,aId]=k.split('|');const pg=S.pagos[k]=S.pagos[k]||{};
-  if(campo==='pagado'){pg.pagado=v;pg.fecha=v?TODAY():null;if(v&&pg.monto==null)pg.monto=montoPlan(A(aId),mes)}
-  else pg[campo]=v;
-  save();render();
+function precioPack(a,pk){const p=P(planDe(a,ym(pk.start)));return p?p.precio:0}
+function hojaPago(aId,start){
+  const a=A(aId),pk=packsDe(aId).find(p=>p.start===start);if(!pk)return;
+  const r=pagoDe(pk)||{},pagado=!!r.pagado,pl=P(planDe(a,ym(start)));
+  openSheet(`<h3>${esc(a.nombre)}</h3><p class="muted">Pack de ${pk.tope} clases${pl?' ('+esc(pl.nombre)+')':''} · empieza el ${DIAS[wd(start)]} ${fmtCorto(start)} · ${hechasPack(pk)} hechas</p>
+  <label class="sw" style="margin:12px 0"><input type="checkbox" id="pgOk" ${pagado?'checked':''}> <span>Pagado</span></label>
+  <label>Fecha de pago<input type="date" id="pgF" value="${r.fecha||TODAY()}"></label>
+  <label>Monto $<input type="number" id="pgM" inputmode="numeric" value="${r.monto!=null?r.monto:precioPack(a,pk)}"></label>
+  <label>Medio de pago<select id="pgMe">${['','Efectivo','Transferencia','Otro'].map(m=>`<option value="${m}" ${(r.metodo||'')===m?'selected':''}>${m||'—'}</option>`).join('')}</select></label>
+  <button class="btn" onclick="guardarPago('${aId}','${start}')">Guardar</button>
+  <p class="muted small">Al registrar el pago, todas las clases de este pack se ven en verde. La cuenta no se reinicia: sigue hasta completar el pack.</p>`);
+}
+function guardarPago(aId,start){
+  const pk=packsDe(aId).find(p=>p.start===start);if(!pk)return;
+  let r=pagoDe(pk);if(!r){r={id:uid(),alumnoId:aId,desde:start};S.pagosPack.push(r)}
+  r.pagado=document.getElementById('pgOk').checked;
+  r.fecha=r.pagado?(document.getElementById('pgF').value||TODAY()):null;
+  r.monto=+document.getElementById('pgM').value||0;r.metodo=document.getElementById('pgMe').value;
+  save();closeSheet();render();toast(r.pagado?'Pago registrado':'Pago quitado');
 }
 function setSuelta(id,campo,v){const e=S.extras.find(x=>x.id===id);if(!e)return;e[campo]=v;if(campo==='pagado')e.fechaPago=v?(e.fechaPago||TODAY()):null;save();render()}
 function vPagos(){
-  const mes=ui.mesPagos;let cob=0,pend=0;
-  const rows=S.alumnos.filter(a=>a.activo!==false||S.pagos[mes+'|'+a.id]||sueltasMes(a.id,mes).length).sort(byNombre).map(a=>{
-    const pid=planDe(a,mes),p=P(pid),k=mes+'|'+a.id,pg=S.pagos[k]||{},monto=montoPlan(a,mes),sl=sueltasMes(a.id,mes);
-    if(p){if(pg.pagado)cob+=+monto||0;else pend+=+monto||0}
-    sl.forEach(e=>{if(e.pagado)cob+=+e.monto||0;else pend+=+e.monto||0});
-    const tiene=!!p||sl.length>0;
-    const debe=(p&&!pg.pagado)||sl.some(e=>!e.pagado);
+  const mes=ui.mesPagos,mesHoy=ym(TODAY());let cob=0,pend=0;
+  (S.pagosPack||[]).forEach(r=>{if(r.pagado&&r.fecha&&ym(r.fecha)===mes)cob+=+r.monto||0});
+  S.extras.forEach(e=>{if(e.tipo==='suelta'&&e.pagado&&ym(e.fechaPago||e.fecha)===mes)cob+=+e.monto||0});
+  const rows=S.alumnos.sort(byNombre).map(a=>{
+    const pid=planDe(a,mes),sl=sueltasMes(a.id,mes);
+    const pks=packsDe(a.id).filter(pk=>{const e=estadoPack(pk);if(!e)return false;const r=pagoDe(pk);
+      return ym(pk.start)===mes||(r&&r.pagado&&r.fecha&&ym(r.fecha)===mes)||(e==='bad'&&ym(pk.start)<mes&&mes>=mesHoy)});
+    if(a.activo===false&&!pks.length&&!sl.length)return null;
+    pks.forEach(pk=>{if(estadoPack(pk)==='bad')pend+=+((pagoDe(pk)||{}).monto??precioPack(a,pk))||0});
+    sl.forEach(e=>{if(!e.pagado)pend+=+e.monto||0});
+    const tiene=pks.length>0||sl.length>0;
+    const debe=pks.some(pk=>estadoPack(pk)==='bad'&&pk.start<=TODAY())||sl.some(e=>!e.pagado);
     const html=`<div class="card pago ${debe||!tiene?'':'okc'}" ${!tiene?'style="border-left-color:var(--line)"':''}>
       <div class="phd"><b onclick="verFicha('${a.id}')">${esc(a.nombre)}</b></div>
       <label>Plan<select onchange="cambiarPlan('${a.id}','${mes}',this.value)">${planOpts(pid)}</select></label>
-      ${p?`<div class="prow"><label class="sw"><input type="checkbox" ${pg.pagado?'checked':''} onchange="setPago('${k}','pagado',this.checked)"><span>${pg.pagado?'Pagó'+(pg.fecha?' el '+fmtCorto(pg.fecha):''):'No pagó'}</span></label><input class="monto" type="number" inputmode="numeric" value="${monto}" onchange="setPago('${k}','monto',+this.value)"></div>
-      ${pg.pagado?`<label>Fecha de pago<input type="date" value="${pg.fecha||''}" onchange="setPago('${k}','fecha',this.value||null)"></label>`:''}
-      <select onchange="setPago('${k}','metodo',this.value)">${['','Efectivo','Transferencia','Otro'].map(m=>`<option value="${m}" ${(pg.metodo||'')===m?'selected':''}>${m||'Medio de pago…'}</option>`).join('')}</select>`:''}
+      ${pks.map(packLinea).join('')}
+      ${!pks.length&&pid?`<p class="muted small">Ningún pack empieza en ${MESES[+mes.slice(5)-1]}.</p>`:''}
       ${sl.map(e=>`<div class="prow"><label class="sw"><input type="checkbox" ${e.pagado?'checked':''} onchange="setSuelta('${e.id}','pagado',this.checked)"><span>Clase suelta ${fmtCorto(e.fecha)}</span></label><input class="monto" type="number" inputmode="numeric" value="${e.monto||0}" onchange="setSuelta('${e.id}','monto',+this.value)"></div>${e.pagado?`<label>Fecha de pago de la clase suelta<input type="date" value="${e.fechaPago||''}" onchange="setSuelta('${e.id}','fechaPago',this.value||null)"></label>`:''}`).join('')}
     </div>`;
     return{debe,tiene,html};
-  });
+  }).filter(Boolean);
   let h=`<div class="mesnav"><button class="ic" onclick="ui.mesPagos=addMonth(ui.mesPagos,-1);render()">‹</button><b>${cap(mesLabel(mes))}</b><button class="ic" onclick="ui.mesPagos=addMonth(ui.mesPagos,1);render()">›</button></div>
-  <div class="tot"><div><b style="color:var(--ok)">${plata(cob)}</b><span>Cobrado</span></div><div><b style="color:var(--bad)">${plata(pend)}</b><span>Falta cobrar</span></div></div>
+  <div class="tot"><div><b style="color:var(--ok)">${plata(cob)}</b><span>Cobrado en el mes</span></div><div><b style="color:var(--bad)">${plata(pend)}</b><span>Falta cobrar</span></div></div>
   <div class="filt">${[['todos','Todos'],['deben','Deben'],['pagaron','Pagaron']].map(([v,l])=>`<button class="${ui.filtroPago===v?'on':''}" onclick="ui.filtroPago='${v}';render()">${l}</button>`).join('')}</div>`;
   const f=rows.filter(r=>ui.filtroPago==='todos'||(ui.filtroPago==='deben'?r.debe:(r.tiene&&!r.debe)));
   if(!S.alumnos.length)return h+empty('Sin alumnos todavía','Cuando cargues alumnos van a aparecer acá para registrar sus pagos.','');
   h+=f.length?f.map(r=>r.html).join(''):`<p class="muted center">Nadie en esta lista.</p>`;
-  h+=`<p class="legend">Las clases sueltas se agregan desde el Calendario y aparecen acá para cobrarlas.</p>`;
+  h+=`<p class="legend">Se muestran los packs que empiezan en el mes, los pagados en el mes y, en el mes actual, los packs anteriores que siguen sin pagar. Tocá un pack para registrar el pago.</p>`;
   return h;
 }
 
@@ -637,9 +715,10 @@ function vAjustes(){
   h+=`<div class="addh"><div class="diasel">${[1,2,3,4,5,6,7].map(d=>`<label><input type="checkbox" value="${d}" class="hd"><span>${DIAS_C[d]}</span></label>`).join('')}</div>
   <div class="prow"><label>Hora<input type="time" id="hH" value="18:00"></label><label>Cupo<input type="number" id="hC" value="4" min="1" inputmode="numeric"></label></div>
   <button class="btn" onclick="agregarHorario()">Agregar horario</button><p class="muted small">Podés marcar varios días a la vez.</p></div></div>`;
-  h+=`<div class="card"><h4>Planes y precios</h4>${S.planes.map(p=>`<div class="plan"><input value="${esc(p.nombre)}" onchange="setPlanCfg('${p.id}','nombre',this.value)"><div class="prow"><label>Clases por semana<input type="number" inputmode="numeric" value="${p.porSemana}" onchange="setPlanCfg('${p.id}','porSemana',+this.value)"></label><label>Clases del pack<input type="number" inputmode="numeric" value="${cicloDe(p)}" onchange="setPlanCfg('${p.id}','clases',+this.value)"></label><label>Precio mensual $<input type="number" inputmode="numeric" value="${p.precio}" onchange="setPlanCfg('${p.id}','precio',+this.value)"></label></div><button class="link bad" onclick="borrarPlan('${p.id}')">Borrar plan</button></div>`).join('')}
+  h+=`<div class="card"><h4>Planes y precios</h4>${S.planes.map(p=>`<div class="plan"><input value="${esc(p.nombre)}" onchange="setPlanCfg('${p.id}','nombre',this.value)"><div class="prow"><label>Clases por semana<input type="number" inputmode="numeric" value="${p.porSemana}" onchange="setPlanCfg('${p.id}','porSemana',+this.value)"></label><label>Clases del pack<input type="number" inputmode="numeric" value="${cicloDe(p)}" onchange="setPlanCfg('${p.id}','clases',+this.value)"></label><label>Precio del pack $<input type="number" inputmode="numeric" value="${p.precio}" onchange="setPlanCfg('${p.id}','precio',+this.value)"></label></div><button class="link bad" onclick="borrarPlan('${p.id}')">Borrar plan</button></div>`).join('')}
   <button class="btn ghost" onclick="nuevoPlan()">+ Agregar plan</button>
   <label>Precio de la clase suelta $<input type="number" inputmode="numeric" value="${S.precioSuelta}" onchange="S.precioSuelta=+this.value;save();toast('Guardado')"></label></div>`;
+  h+=`<div class="card"><h4>Control de pagos</h4><label>Controlar los packs que empiezan desde<input type="date" value="${S.pagosDesde||''}" onchange="S.pagosDesde=this.value||TODAY();save();render();toast('Guardado')"></label><p class="muted small">Los packs que empezaron antes de esta fecha no se marcan en rojo ni en verde.</p></div>`;
   const ub=S.ultimoBackup,viejo=!ub||diasDesde(ub)>14;
   h+=`<div class="card"><h4>Copia de seguridad</h4><p class="small">Los datos se guardan en este celular. Hacé una copia cada tanto y guardala en Drive, mail o WhatsApp.</p>
   <p class="small ${viejo?'aviso':'muted'}">${ub?'Última copia: '+fmtCorto(ub)+'/'+ub.slice(0,4):'Todavía no hiciste ninguna copia.'}</p>
@@ -681,7 +760,7 @@ function importar(inp){
   r.onload=()=>{
     try{const d=JSON.parse(r.result);if(!d||!Array.isArray(d.alumnos)||!Array.isArray(d.horarios))throw 0;
       if(!confirm('Esto reemplaza todos los datos actuales por los de la copia. ¿Seguimos?'))return;
-      S=Object.assign(defState(),d);save();render();toast('Datos recuperados');
+      S=Object.assign(defState(),d);_memo={};migrar();save();render();toast('Datos recuperados');
     }catch(e){toast('Ese archivo no es una copia válida')}
     inp.value='';
   };
@@ -689,8 +768,26 @@ function importar(inp){
 }
 function borrarTodo(){if(!confirm('Se borran TODOS los datos de este celular. ¿Seguro?'))return;if(!confirm('Última confirmación: ¿borrar todo?'))return;S=defState();save();render();toast('Datos borrados')}
 
+/* Actualización de datos guardados: contador con anclas y pagos por pack */
+function migrar(){
+  S.pagosPack=S.pagosPack||[];S.suspendidos=S.suspendidos||{};
+  S.alumnos.forEach(a=>{if(!a.anclas)a.anclas=a.contador&&a.contador.desde?[{desde:a.contador.desde,base:a.contador.base||0}]:[]});
+  if(!S.pagosDesde){
+    const ms=Object.keys(S.pagos||{}).map(k=>k.split('|')[0]).sort();
+    S.pagosDesde=(ms[0]||ym(TODAY()))+'-01';_memo={};
+    // los pagos mensuales ya cargados pasan al pack que estaba en curso en la fecha de pago
+    Object.keys(S.pagos||{}).sort().forEach(k=>{
+      const pg=S.pagos[k];if(!pg||!pg.pagado)return;const[mes,aId]=k.split('|');
+      const ps=packsDe(aId).filter(p=>estadoPack(p));if(!ps.length)return;
+      const f=pg.fecha||mes+'-01';let i=0;ps.forEach((p,j)=>{if(p.start<=f)i=j});
+      while(i<ps.length&&pagoDe(ps[i]))i++;if(i>=ps.length)return;
+      S.pagosPack.push({id:uid(),alumnoId:aId,desde:ps[i].start,pagado:true,fecha:pg.fecha||null,monto:pg.monto,metodo:pg.metodo||''});
+    });
+    save();
+  }
+}
 /* ============ Inicio ============ */
-load();
+load();migrar();
 (function(){
   const hoy=TODAY(),w=wd(hoy);
   ui.mesPagos=ym(hoy);ui.mesAl=ym(hoy);
